@@ -1,7 +1,10 @@
-import os
+# --- 1. STREAMLIT CLOUD SQLITE PATCH ---
+# This MUST be at the very top of the file to prevent ChromaDB from crashing on the cloud.
 __import__('pysqlite3')
 import sys
 sys.modules['sqlite3'] = sys.modules.pop('pysqlite3')
+
+import os
 import streamlit as st
 import chromadb
 from chromadb import Documents, EmbeddingFunction, Embeddings
@@ -10,35 +13,38 @@ from google import genai
 from google.genai import types
 from dotenv import load_dotenv
 
-# --- 1. Load Environment Variables (No more Sidebar Input) ---
-load_dotenv()
-api_key = os.getenv("GEMINI_API_KEY")
+# --- 2. Load Environment Variables ---
+# First, try to get the key from Streamlit Cloud Secrets. If that fails, look for the local .env file.
+try:
+    api_key = st.secrets["GEMINI_API_KEY"]
+except KeyError:
+    load_dotenv()
+    api_key = os.getenv("GEMINI_API_KEY")
 
 if not api_key:
-    st.error("🚨 GEMINI_API_KEY not found. Please ensure it is in your .env file.")
+    st.error("🚨 GEMINI_API_KEY not found. Please add it to your .env file or Streamlit Cloud Secrets.")
     st.stop()
 
-# --- 2. Custom Embedding Function ---
+# --- 3. Custom Embedding Function ---
 class GeminiEmbeddingFunction(EmbeddingFunction):
     def __init__(self, key: str):
-        self.client = genai.Client(api_key=key)
+        # We create a lightweight, temporary client just for embeddings
+        self.embed_client = genai.Client(api_key=key)
         
     def __call__(self, input: Documents) -> Embeddings:
-        response = self.client.models.embed_content(
+        response = self.embed_client.models.embed_content(
             model='gemini-embedding-001',
             contents=input,
         )
         return [e.values for e in response.embeddings]
 
-# --- 3. UI Configuration ---
+# --- 4. UI Configuration ---
 st.set_page_config(page_title="PsyScreen-RAG", page_icon="🧠", layout="wide")
 st.title("PsyScreen-RAG Clinical Assistant")
 st.markdown("MS Thesis Project | Developed by Abu Huraira")
 
-# --- 4. Initialize Client & RAG Database ---
-client = genai.Client(api_key=api_key)
-
-@st.cache_resource(show_spinner="Connecting to Local Vector Database...")
+# --- 5. Initialize RAG Database ---
+@st.cache_resource(show_spinner="Connecting to Vector Database...")
 def get_chroma_collection(api_key_val):
     db_client = chromadb.PersistentClient(path="./chroma_db")
     embedder = GeminiEmbeddingFunction(key=api_key_val)
@@ -47,30 +53,35 @@ def get_chroma_collection(api_key_val):
 try:
     collection = get_chroma_collection(api_key)
 except Exception as e:
-    st.error(f"ChromaDB Error. Did you run build_db.py? Details: {e}")
+    st.error(f"ChromaDB Error. Did you run build_db.py locally and push the folder to GitHub? Details: {e}")
     st.stop()
 
-# --- 5. System Instructions ---
+# --- 6. System Instructions (Upgraded for Interaction & Reasoning) ---
 system_prompt = """
 System Identity & Purpose
-"PsyScreen-RAG" is a clinical assistant. You are administering standardized mental health screenings.
-You must fluently understand and respond in the user's preferred language: English, Urdu, or Roman Urdu.
+You are "PsyScreen-RAG", an interactive, empathetic, and highly competent clinical assistant developed for an MS Thesis.
+You administer standardized mental health screenings (PHQ-9, GAD-7, etc.) based STRICTLY on the provided RAG context.
+You must fluently understand and respond in the user's preferred language: English, Urdu, or Roman Urdu (Minglish).
 
-Core Operating Instructions - STRICT EXAMINER MODE:
-1. Ask exactly ONE question at a time. Do not list multiple questions.
-2. Wait for the user to answer the current question before moving to the next.
-3. Use the "Clinical Context" provided to formulate the exact questionnaire items (PHQ-9, GAD-7, etc.).
-4. When a test is finished, calculate the score based on the RAG rubric.
-5. Always include this disclaimer upon scoring: "This is a screening tool, not a formal medical diagnosis."
+Core Operating Instructions - INTERACTIVE EXAMINER MODE:
+1. Be Conversational & Validating: Before asking the next question, briefly and professionally validate the user's previous answer (e.g., "I understand, that sounds difficult," or "Thank you for sharing that").
+2. Ask Exactly ONE Question: After validating, smoothly transition into asking ONLY the exact next questionnaire item. Never list multiple questions. Wait for the user's response.
+3. Diagnostic Logic: When a test is finished, calculate the score based on the RAG rubric.
+4. Always include this disclaimer upon scoring: "This is a screening tool, not a formal medical diagnosis."
+5. Provide Rationale: When generating the final report, explicitly cite the clinical reasoning based on the RAG data (e.g., explain *why* a specific CBT technique is recommended based on their specific answers).
 """
 
-# --- 6. Session State Initialization (Using Gemini 3 Flash Preview) ---
+# --- 7. Session State Initialization (The Connection Fix) ---
+# We store the main GenAI client in session state so the httpx connection NEVER closes between messages
+if "genai_client" not in st.session_state:
+    st.session_state.genai_client = genai.Client(api_key=api_key)
+
 if "chat_session" not in st.session_state:
-    st.session_state.chat_session = client.chats.create(
+    st.session_state.chat_session = st.session_state.genai_client.chats.create(
         model="gemini-3-flash-preview",
         config=types.GenerateContentConfig(
             system_instruction=system_prompt,
-            temperature=0.1, 
+            temperature=0.3, # Slightly increased from 0.1 to allow for a warmer, more natural conversational tone
             thinking_config=types.ThinkingConfig(
                 thinking_level="HIGH"
             )
@@ -81,13 +92,13 @@ if "messages" not in st.session_state:
     st.session_state.messages = []
     try:
         initial_response = st.session_state.chat_session.send_message(
-            "Greet the user, ask which language they prefer (English, Urdu, or Roman Urdu), and ask if they are ready to begin the screening."
+            "Warmly greet the user, ask which language they prefer (English, Urdu, or Roman Urdu), explain the purpose of the screening, and ask if they are ready to begin."
         )
         st.session_state.messages.append({"role": "assistant", "content": initial_response.text})
     except Exception as e:
-        st.error(f"API Error: {e}")
+        st.error(f"API Error during initialization: {e}")
 
-# --- 7. Crisis Detection Failsafe ---
+# --- 8. Crisis Detection Failsafe ---
 def check_for_crisis(user_text):
     crisis_keywords = [
         r"\bkill myself\b", r"\bsuicide\b", r"\bend it all\b", r"\bwant to die\b", 
@@ -113,28 +124,38 @@ def get_crisis_response():
     *Your session has been paused for your safety.*
     """
 
-# --- 8. Sidebar & Report Generation ---
+# --- 9. Sidebar & Final Report Generation ---
 st.sidebar.header("Patient Reporting")
 if st.sidebar.button("📄 Generate Final Clinical Report"):
-    with st.spinner("Compiling structured report..."):
-        report_prompt = "The screening is complete. Generate a final clinical report including Tests Administered, Calculated Scores, and CBT Recommendations based strictly on the RAG data. Use Markdown tables."
+    with st.spinner("Compiling structured report with clinical rationale..."):
+        report_prompt = """
+        The screening is complete. Generate a comprehensive final clinical report. 
+        Format nicely with Markdown tables and bullet points.
+        It MUST include:
+        1. Tests Administered.
+        2. Calculated Scores & Severity Categories.
+        3. A brief paragraph citing the clinical rationale for this severity category based on the RAG data.
+        4. Recommended CBT Techniques, explicitly explaining WHY these techniques were chosen based on the user's specific answers during the test.
+        """
         response = st.session_state.chat_session.send_message(report_prompt)
         st.session_state.messages.append({"role": "assistant", "content": response.text})
         st.rerun()
 
-# --- 9. Render Chat UI ---
+# --- 10. Render Chat UI ---
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
-# --- 10. Handle User Input & RAG ---
+# --- 11. Handle User Input & RAG ---
 user_input = st.chat_input("Type your response here...")
 
 if user_input:
+    # 1. Display User Message
     with st.chat_message("user"):
         st.markdown(user_input)
     st.session_state.messages.append({"role": "user", "content": user_input})
 
+    # 2. Hardcoded Crisis Failsafe
     if check_for_crisis(user_input):
         crisis_msg = get_crisis_response()
         with st.chat_message("assistant"):
@@ -142,11 +163,12 @@ if user_input:
         st.session_state.messages.append({"role": "assistant", "content": crisis_msg})
         st.stop() 
 
-    # Query the database
-    with st.spinner("Retrieving clinical data from PDFs..."):
+    # 3. Query the Database
+    with st.spinner("Retrieving clinical data from manuals..."):
         results = collection.query(query_texts=[user_input], n_results=3)
-        retrieved_context = "\n\n".join(results["documents"][0]) if results["documents"] else "No context found."
+        retrieved_context = "\n\n".join(results["documents"][0]) if results["documents"] else "No specific clinical context found."
 
+    # 4. Enriched Prompt Injection
     enriched_prompt = f"""
     [Clinical Context from Database]:
     {retrieved_context}
@@ -154,13 +176,12 @@ if user_input:
     [User Input]:
     {user_input}
     
-    Using the clinical context above, determine the next step. If administering a test, ask ONLY the next question.
+    Using the clinical context above, determine the next step. If you are administering a test, briefly validate the user's input, then ask ONLY the exact next question. Do not skip ahead.
     """
 
+    # 5. Send to Gemini and Display
     with st.chat_message("assistant"):
         with st.spinner("Thinking..."):
             response = st.session_state.chat_session.send_message(enriched_prompt)
             st.markdown(response.text)
-
             st.session_state.messages.append({"role": "assistant", "content": response.text})
-
