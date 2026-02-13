@@ -1,4 +1,7 @@
 import os
+__import__('pysqlite3')
+import sys
+sys.modules['sqlite3'] = sys.modules.pop('pysqlite3')
 import streamlit as st
 import chromadb
 from chromadb import Documents, EmbeddingFunction, Embeddings
@@ -158,4 +161,5 @@ if user_input:
         with st.spinner("Thinking..."):
             response = st.session_state.chat_session.send_message(enriched_prompt)
             st.markdown(response.text)
+
             st.session_state.messages.append({"role": "assistant", "content": response.text})
