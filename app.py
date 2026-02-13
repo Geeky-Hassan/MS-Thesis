@@ -14,7 +14,6 @@ from google.genai import types
 from dotenv import load_dotenv
 
 # --- 2. Load Environment Variables ---
-# First, try to get the key from Streamlit Cloud Secrets. If that fails, look for the local .env file.
 try:
     api_key = st.secrets["GEMINI_API_KEY"]
 except KeyError:
@@ -28,7 +27,6 @@ if not api_key:
 # --- 3. Custom Embedding Function ---
 class GeminiEmbeddingFunction(EmbeddingFunction):
     def __init__(self, key: str):
-        # We create a lightweight, temporary client just for embeddings
         self.embed_client = genai.Client(api_key=key)
         
     def __call__(self, input: Documents) -> Embeddings:
@@ -56,7 +54,7 @@ except Exception as e:
     st.error(f"ChromaDB Error. Did you run build_db.py locally and push the folder to GitHub? Details: {e}")
     st.stop()
 
-# --- 6. System Instructions (Upgraded for Interaction & Reasoning) ---
+# --- 6. System Instructions ---
 system_prompt = """
 System Identity & Purpose
 You are "PsyScreen-RAG", an interactive, empathetic, and highly competent clinical assistant developed for an MS Thesis.
@@ -64,15 +62,14 @@ You administer standardized mental health screenings (PHQ-9, GAD-7, etc.) based 
 You must fluently understand and respond in the user's preferred language: English, Urdu, or Roman Urdu (Minglish).
 
 Core Operating Instructions - INTERACTIVE EXAMINER MODE:
-1. Be Conversational & Validating: Before asking the next question, briefly and professionally validate the user's previous answer (e.g., "I understand, that sounds difficult," or "Thank you for sharing that").
-2. Ask Exactly ONE Question: After validating, smoothly transition into asking ONLY the exact next questionnaire item. Never list multiple questions. Wait for the user's response.
+1. Be Conversational & Validating: Before asking the next question, briefly validate the user's previous answer.
+2. Ask Exactly ONE Question: After validating, smoothly transition into asking ONLY the exact next questionnaire item. Wait for the user's response.
 3. Diagnostic Logic: When a test is finished, calculate the score based on the RAG rubric.
 4. Always include this disclaimer upon scoring: "This is a screening tool, not a formal medical diagnosis."
-5. Provide Rationale: When generating the final report, explicitly cite the clinical reasoning based on the RAG data (e.g., explain *why* a specific CBT technique is recommended based on their specific answers).
+5. Provide Rationale: When generating the final report, explicitly cite the clinical reasoning based on the RAG data.
 """
 
-# --- 7. Session State Initialization (The Connection Fix) ---
-# We store the main GenAI client in session state so the httpx connection NEVER closes between messages
+# --- 7. Session State Initialization ---
 if "genai_client" not in st.session_state:
     st.session_state.genai_client = genai.Client(api_key=api_key)
 
@@ -81,7 +78,7 @@ if "chat_session" not in st.session_state:
         model="gemini-3-flash-preview",
         config=types.GenerateContentConfig(
             system_instruction=system_prompt,
-            temperature=0.3, # Slightly increased from 0.1 to allow for a warmer, more natural conversational tone
+            temperature=0.3,
             thinking_config=types.ThinkingConfig(
                 thinking_level="HIGH"
             )
@@ -124,8 +121,20 @@ def get_crisis_response():
     *Your session has been paused for your safety.*
     """
 
-# --- 9. Sidebar & Final Report Generation ---
+# --- 9. Sidebar & Session Management ---
 st.sidebar.header("Patient Reporting")
+
+# NEW: Clear Chat / Start New Test Button
+if st.sidebar.button("🔄 Start New Test / Clear Chat"):
+    if "messages" in st.session_state:
+        del st.session_state["messages"]
+    if "chat_session" in st.session_state:
+        del st.session_state["chat_session"]
+    st.rerun()
+
+st.sidebar.markdown("---")
+
+# Final Report Button
 if st.sidebar.button("📄 Generate Final Clinical Report"):
     with st.spinner("Compiling structured report with clinical rationale..."):
         report_prompt = """
@@ -150,12 +159,10 @@ for msg in st.session_state.messages:
 user_input = st.chat_input("Type your response here...")
 
 if user_input:
-    # 1. Display User Message
     with st.chat_message("user"):
         st.markdown(user_input)
     st.session_state.messages.append({"role": "user", "content": user_input})
 
-    # 2. Hardcoded Crisis Failsafe
     if check_for_crisis(user_input):
         crisis_msg = get_crisis_response()
         with st.chat_message("assistant"):
@@ -163,12 +170,10 @@ if user_input:
         st.session_state.messages.append({"role": "assistant", "content": crisis_msg})
         st.stop() 
 
-    # 3. Query the Database
     with st.spinner("Retrieving clinical data from manuals..."):
         results = collection.query(query_texts=[user_input], n_results=3)
         retrieved_context = "\n\n".join(results["documents"][0]) if results["documents"] else "No specific clinical context found."
 
-    # 4. Enriched Prompt Injection
     enriched_prompt = f"""
     [Clinical Context from Database]:
     {retrieved_context}
@@ -179,7 +184,6 @@ if user_input:
     Using the clinical context above, determine the next step. If you are administering a test, briefly validate the user's input, then ask ONLY the exact next question. Do not skip ahead.
     """
 
-    # 5. Send to Gemini and Display
     with st.chat_message("assistant"):
         with st.spinner("Thinking..."):
             response = st.session_state.chat_session.send_message(enriched_prompt)
